@@ -559,38 +559,139 @@
       } catch (_) {}
 
       let count = 1;
+      let scoopBuffer = null;
       let playing = true;
       let audioContext = null;
+      let audioOutput = null;
+      let audioProblem = false;
+      const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
       function persist() {
         try { localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)); } catch (_) {}
       }
 
+      function updateSoundControl() {
+        els.sound.textContent = !saved.sound ? "×" : audioProblem ? "!" : "♪";
+        els.sound.setAttribute("aria-pressed", String(saved.sound));
+        const label = !saved.sound ? "Turn sound on" : audioProblem ? "Retry sound" : "Turn sound off";
+        els.sound.setAttribute("aria-label", label);
+        els.sound.title = !saved.sound ? "Sound off" : audioProblem ? "Sound couldn't start — tap to retry" : "Sound on";
+      }
+
+      function getScoopBuffer(context) {
+        if (scoopBuffer) return scoopBuffer;
+        // Original procedural sound: a falling bubble, a little rebound, and a
+        // soft wet transient. No recording, external asset, or network request.
+        const sampleRate = 44100;
+        const duration = .14;
+        const frames = Math.round(sampleRate * duration);
+        const buffer = context.createBuffer(1, frames, sampleRate);
+        const samples = buffer.getChannelData(0);
+        let phase = 0;
+        let reboundPhase = 0;
+        let noiseFast = 0;
+        let noiseSlow = 0;
+        let seed = 0x53434f50;
+        for (let frame = 0; frame < frames; frame++) {
+          const t = frame / sampleRate;
+          // A private noise generator keeps sound independent of game chance.
+          seed ^= seed << 13;
+          seed ^= seed >>> 17;
+          seed ^= seed << 5;
+          const noise = (seed >>> 0) / 2147483648 - 1;
+          noiseFast += .28 * (noise - noiseFast);
+          noiseSlow += .05 * (noise - noiseSlow);
+
+          const frequency = 145 + 490 * Math.exp(-t / .012);
+          phase += 2 * Math.PI * frequency / sampleRate;
+          const bodyEnvelope = (1 - Math.exp(-t / .0018)) * Math.exp(-t / .023);
+          const body = .58 * bodyEnvelope * (Math.sin(phase) + .14 * Math.sin(2 * phase));
+
+          const reboundTime = Math.max(0, t - .011);
+          reboundPhase += 2 * Math.PI * (200 + 200 * Math.exp(-reboundTime / .012)) / sampleRate;
+          const reboundEnvelope = (1 - Math.exp(-reboundTime / .002)) * Math.exp(-reboundTime / .013);
+          const rebound = .12 * reboundEnvelope * Math.sin(reboundPhase);
+          const squishEnvelope = (1 - Math.exp(-t / .0008)) * Math.exp(-t / .01);
+          const squish = .25 * squishEnvelope * (noiseFast - noiseSlow);
+          const tailFade = Math.min(1, (frames - 1 - frame) / (sampleRate * .012));
+          samples[frame] = (body + rebound + squish) * tailFade;
+        }
+        scoopBuffer = buffer;
+        return buffer;
+      }
+
       function sound(notes) {
-        if (!saved.sound || !window.AudioContext && !window.webkitAudioContext) return;
+        if (!saved.sound) return;
         // Sound is optional: restricted viewers or audio failures must not stop a round.
         try {
-          const AudioCtx = window.AudioContext || window.webkitAudioContext;
-          audioContext = audioContext || new AudioCtx();
-          if (audioContext.state === "suspended") {
-            const resumed = audioContext.resume();
-            if (resumed && typeof resumed.catch === "function") resumed.catch(() => {});
+          // This workaround is for iOS Silent Mode; leave desktop audio sessions alone.
+          if (isIOSDevice) {
+            try {
+              if (navigator.audioSession) navigator.audioSession.type = "playback";
+            } catch (_) {}
           }
-          const now = audioContext.currentTime;
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (!AudioCtx) throw new Error("Web Audio is unavailable in this viewer.");
+          if (!audioContext || audioContext.state === "closed") {
+            audioContext = new AudioCtx();
+            audioOutput = null;
+          }
+          if (!audioOutput) {
+            const output = audioContext.createGain();
+            output.connect(audioContext.destination);
+            audioOutput = output;
+          }
+          const context = audioContext;
+          audioOutput.gain.setValueAtTime(1, context.currentTime);
+          audioProblem = false;
+          // Start sources during the tap, as in the original working Mac version.
+          // Waiting for resume() first can strand playback in some WebKit versions.
+          if (context.state !== "running") {
+            const resumed = context.resume();
+            if (resumed && typeof resumed.then === "function") {
+              resumed.then(() => {
+                if (context !== audioContext) return;
+                audioProblem = context.state !== "running";
+                updateSoundControl();
+              }).catch(() => {
+                if (context !== audioContext) return;
+                audioProblem = true;
+                updateSoundControl();
+              });
+            }
+          }
+          const now = context.currentTime;
           notes.forEach(({ f, at = 0, d = .1, type = "sine", gain = .04 }) => {
-            const oscillator = audioContext.createOscillator();
-            const volume = audioContext.createGain();
-            oscillator.type = type;
-            oscillator.frequency.setValueAtTime(f, now + at);
-            volume.gain.setValueAtTime(0, now + at);
-            volume.gain.linearRampToValueAtTime(gain, now + at + .012);
-            volume.gain.exponentialRampToValueAtTime(.001, now + at + d);
-            oscillator.connect(volume).connect(audioContext.destination);
-            oscillator.start(now + at);
-            oscillator.stop(now + at + d + .02);
+            const volume = context.createGain();
+            let source;
+            if (type === "sample") {
+              source = context.createBufferSource();
+              source.buffer = getScoopBuffer(context);
+              d = source.buffer.duration;
+              // The procedural buffer already includes its attack and decay.
+              volume.gain.setValueAtTime(gain, now + at);
+            } else {
+              source = context.createOscillator();
+              source.type = type;
+              source.frequency.setValueAtTime(f, now + at);
+              volume.gain.setValueAtTime(0, now + at);
+              volume.gain.linearRampToValueAtTime(gain, now + at + .008);
+              volume.gain.exponentialRampToValueAtTime(.001, now + at + d);
+            }
+            source.connect(volume);
+            volume.connect(audioOutput);
+            source.onended = () => {
+              source.disconnect();
+              volume.disconnect();
+            };
+            source.start(now + at);
+            source.stop(now + at + d + .02);
           });
+          updateSoundControl();
         } catch (_) {
-          audioContext = null;
+          audioProblem = true;
+          updateSoundControl();
         }
       }
 
@@ -694,10 +795,7 @@
 
         count = next;
         renderScoops(count - 1);
-        sound([
-          { f: 392, d: .09, type: "sine", gain: .035 },
-          { f: 523.25, at: .08, d: .12, type: "sine", gain: .04 }
-        ]);
+        sound([{ type: "sample", gain: 1 }]);
         window.setTimeout(() => setControls(false), 560);
       }
 
@@ -735,11 +833,13 @@
       els.eat.addEventListener("click", eatCone);
       els.again.addEventListener("click", resetRound);
       els.sound.addEventListener("click", () => {
-        saved.sound = !saved.sound;
-        els.sound.textContent = saved.sound ? "♪" : "×";
-        els.sound.setAttribute("aria-pressed", String(saved.sound));
-        els.sound.setAttribute("aria-label", saved.sound ? "Turn sound off" : "Turn sound on");
-        els.sound.title = saved.sound ? "Sound on" : "Sound off";
+        // A failed start offers a retry, rather than silently toggling sound off.
+        if (!(saved.sound && audioProblem)) saved.sound = !saved.sound;
+        audioProblem = false;
+        if (audioOutput && audioContext.state !== "closed") {
+          audioOutput.gain.setValueAtTime(saved.sound ? 1 : 0, audioContext.currentTime);
+        }
+        updateSoundControl();
         persist();
         if (saved.sound) sound([{ f: 523.25, d: .12, gain: .035 }]);
       });
@@ -757,9 +857,7 @@
       });
 
       window.addEventListener("resize", updateScale);
-      els.sound.textContent = saved.sound ? "♪" : "×";
-      els.sound.setAttribute("aria-pressed", String(saved.sound));
-      els.sound.setAttribute("aria-label", saved.sound ? "Turn sound off" : "Turn sound on");
+      updateSoundControl();
       updateStats();
       renderScoops();
       setControls(false);
